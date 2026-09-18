@@ -102,6 +102,16 @@ const fn feature(key: &'static str, kind: Kind, doc: &'static str) -> Entry {
 pub const REGISTRY: &[Entry] = &[
     // ── [bus] ────────────────────────────────────────────────────────────────
     entry("bus.port", Kind::Text, "Dynamixel serial port device"),
+    entry(
+        "bus.protocol",
+        Kind::Choice(&["dynamixel2", "feetech-sts"]),
+        "Servo wire protocol — dynamixel2 (XL330) or feetech-sts (HD-1910 build)",
+    ),
+    entry(
+        "bus.feetech",
+        Kind::Record("p_scale = 0.16\ndirections = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]"),
+        "Feetech build only: gain scale and per-joint direction, measured on the bench — edit robotd.toml by hand",
+    ),
     // ── [control] ────────────────────────────────────────────────────────────
     entry("control.hz", Kind::Integer, "Control loop rate"),
     entry(

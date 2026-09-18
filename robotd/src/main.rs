@@ -34,6 +34,8 @@ use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use clap::{Parser, Subcommand};
+use duck_control::bus_feetech::FeetechConfig;
+use duck_control::bus_select::BusProtocol;
 use duck_control::fall::{FallPredictor, FallPredictorConfig};
 use duck_control::io::RobotIo;
 use duck_control::obs::{BodyPose, Command as PolicyCommand};
@@ -1043,7 +1045,14 @@ fn run_init(params: &Params, duration: Duration) -> ExitCode {
     // The same open as the daemon's, replacement adoption included: `init` is what someone
     // reaches for right after a motor swap, and it must not be the one path that refuses the
     // new servo.
-    let Some(mut io) = open_bus(&params.bus.port, 0) else {
+    let protocol = match bus_protocol(&params.bus) {
+        Ok(protocol) => protocol,
+        Err(e) => {
+            tracing::error!(error = %e, "invalid [bus] parameters");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(mut io) = open_bus(&params.bus.port, &protocol, 0) else {
         return ExitCode::FAILURE;
     };
     if let Err(e) = io.set_torque(true) {
@@ -1154,8 +1163,17 @@ fn spawn_control_thread(
             // because nothing had been *attempted* the health reason was the bland "control
             // loop has not completed a cycle yet", forever, whatever happened to the robot
             // afterwards. Retrying the read alone was not enough: execution never got there.
+            // Refused here rather than retried: a direction list of the wrong length does not
+            // fix itself, and waiting on it would read as "servo power is off".
+            let protocol = match bus_protocol(&params.bus) {
+                Ok(protocol) => protocol,
+                Err(e) => {
+                    tracing::error!(error = %e, "invalid [bus] parameters; no control loop");
+                    return;
+                }
+            };
             runtime.block_on(async move {
-                if let Some(io) = open_bus_waiting(&port, &state).await {
+                if let Some(io) = open_bus_waiting(&port, &protocol, &state).await {
                     control_loop(io, state, intents, params, params_path, period, poweroff).await;
                 }
             });
@@ -1164,7 +1182,7 @@ fn spawn_control_thread(
 
 /// The real bus on the board; a fake elsewhere, so `open_bus_waiting` has one signature.
 #[cfg(target_os = "linux")]
-type BusIo = duck_control::bus::DynamixelIo;
+type BusIo = duck_control::bus_select::AnyBus;
 #[cfg(not(target_os = "linux"))]
 type BusIo = FakeIo;
 
@@ -1175,13 +1193,13 @@ type BusIo = FakeIo;
 /// one to abandon the control loop over.
 ///
 /// Returns `None` only if shutdown is requested while waiting.
-async fn open_bus_waiting(port: &str, state: &RobotState) -> Option<BusIo> {
+async fn open_bus_waiting(port: &str, protocol: &BusProtocol, state: &RobotState) -> Option<BusIo> {
     let mut attempt = 0u32;
 
     while !state.shutdown.load(Ordering::Relaxed) {
         // Logging lives in `open_bus`, which is chatty by design on the first attempt and
         // quiet thereafter — a board waiting overnight must not fill the journal.
-        if let Some(io) = open_bus(port, attempt) {
+        if let Some(io) = open_bus(port, protocol, attempt) {
             state.startup_bus_failures.store(0, Ordering::Relaxed);
             return Some(io);
         }
@@ -1201,11 +1219,11 @@ async fn open_bus_waiting(port: &str, state: &RobotState) -> Option<BusIo> {
 
 /// Open and verify the bus, or explain why not.
 #[cfg(target_os = "linux")]
-fn open_bus(port: &str, attempt: u32) -> Option<BusIo> {
+fn open_bus(port: &str, protocol: &BusProtocol, attempt: u32) -> Option<BusIo> {
     // First attempt and every thirtieth — about one line per 30 s while waiting.
     let loud = attempt == 0 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY);
 
-    let mut io = match duck_control::bus::DynamixelIo::open(port) {
+    let mut io = match BusIo::open(port, protocol) {
         Ok(io) => io,
         Err(e) => {
             if loud {
@@ -1218,7 +1236,10 @@ fn open_bus(port: &str, attempt: u32) -> Option<BusIo> {
         return None;
     }
     match io.check_registers() {
-        Ok(0) => tracing::info!("motor registers already correct"),
+        Ok(0) => tracing::info!(
+            protocol = io.protocol_name(),
+            "motor registers already correct"
+        ),
         Ok(n) => tracing::warn!(corrected = n, "motor registers corrected"),
         Err(e) => {
             if loud {
@@ -1232,6 +1253,20 @@ fn open_bus(port: &str, attempt: u32) -> Option<BusIo> {
         }
     }
     Some(io)
+}
+
+/// `[bus]` as the type the bus layer takes.
+///
+/// The parameter crate holds plain values and does not link the control crate, so the checks
+/// that need to know what a joint is — one direction per joint, each of them ±1 — happen here.
+fn bus_protocol(bus: &params::Bus) -> Result<BusProtocol, String> {
+    Ok(match bus.protocol {
+        params::BusProtocol::Dynamixel2 => BusProtocol::Dynamixel2,
+        params::BusProtocol::FeetechSts => BusProtocol::FeetechSts(FeetechConfig::new(
+            bus.feetech.p_scale,
+            &bus.feetech.directions,
+        )?),
+    })
 }
 
 /// The motor-swap path: if exactly one expected servo is silent and a factory-fresh one
@@ -1296,7 +1331,7 @@ fn adopt_missing_servo(io: &mut BusIo, loud: bool) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_bus(_port: &str, _attempt: u32) -> Option<BusIo> {
+fn open_bus(_port: &str, _protocol: &BusProtocol, _attempt: u32) -> Option<BusIo> {
     tracing::error!("no bus on this platform; use --fake");
     None
 }
@@ -6787,9 +6822,13 @@ mod tests {
         ));
         let waiter_state = Arc::clone(&s);
         let handle = tokio::spawn(async move {
-            open_bus_waiting("/dev/definitely-not-a-bus", &waiter_state)
-                .await
-                .is_none()
+            open_bus_waiting(
+                "/dev/definitely-not-a-bus",
+                &BusProtocol::default(),
+                &waiter_state,
+            )
+            .await
+            .is_none()
         });
 
         // Bounded, so a regression fails rather than hanging CI.

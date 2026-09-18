@@ -8,6 +8,8 @@
 //! designed in `docs/design/robotd-design.md` §2.
 
 pub mod bus;
+pub mod bus_feetech;
+pub mod bus_select;
 pub mod fall;
 pub mod imu;
 pub mod io;
