@@ -128,6 +128,14 @@ pub const EXPECTED_REGISTERS: &[(&str, u8)] = &[
     ("shutdown", 52),
 ];
 
+/// The operating mode (register 33) a Feetech HD-1910 is expected to be in.
+///
+/// The HD-1910-C001 ships in mode 4, which its datasheet calls "pure position PD (Sim2Real)":
+/// a PD position loop with no trajectory generator in front of it, which is what a policy
+/// commanding a fresh target every tick wants. Mode 0 is the ordinary position servo. Checked
+/// and reported at startup, never written — see [`crate::bus_feetech::FeetechIo::check_registers`].
+pub const FEETECH_EXPECTED_MODE: u8 = 4;
+
 /// `homing_offset` on the knees, in raw position counts (0.088° each, so −45°).
 ///
 /// Every other joint is at 0. The value is `microduck_runtime`'s `setup_motor_rpi.py`, the

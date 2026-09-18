@@ -2081,6 +2081,36 @@ pub struct Bus {
     /// the bus drops, `update_gate` sees an unhealthy robot, and a release that turned this on
     /// against firmware that cannot do it is rolled back on its own.
     pub fast_sync_read: bool,
+
+    /// The wire the servos speak. `dynamixel2` is the robot as Pollen builds it — XL330s and
+    /// the `imu_to_dxl` board. `feetech-sts` is a build with Feetech STS/SMS-protocol servos
+    /// (HD-1910), which also reads `[bus.feetech]`.
+    pub protocol: BusProtocol,
+    /// Read only when `protocol = "feetech-sts"`.
+    pub feetech: BusFeetech,
+}
+
+/// `[bus] protocol`. An enum rather than a string so a typo is refused when the file is read,
+/// not discovered as a robot that never finds its servos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BusProtocol {
+    #[default]
+    Dynamixel2,
+    FeetechSts,
+}
+
+/// What the Feetech backend cannot read off the bus. Both values are measured on the robot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BusFeetech {
+    /// Feetech `P` (one byte) per unit of the XL330-scale gain the rest of the file is written
+    /// in — `[policy] gain`, `[safety] gain_limp`. 0.16 maps the running gain of 200 onto the
+    /// HD-1910's factory P of 32.
+    pub p_scale: f64,
+    /// +1 or -1 per joint, in joint order (left leg, neck/head/mouth, right leg): whether the
+    /// servo's increasing count is the model's positive rotation.
+    pub directions: Vec<i8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2151,6 +2181,17 @@ impl Default for Bus {
         Self {
             port: "/dev/ttyS2".into(),
             fast_sync_read: true,
+            protocol: BusProtocol::default(),
+            feetech: BusFeetech::default(),
+        }
+    }
+}
+
+impl Default for BusFeetech {
+    fn default() -> Self {
+        Self {
+            p_scale: 0.16,
+            directions: vec![1; 15],
         }
     }
 }
