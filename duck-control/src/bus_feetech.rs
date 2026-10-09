@@ -17,9 +17,13 @@
 //! - **The sign of a joint is not a given.** On the XL330 robot the horn orientation fixes the
 //!   positive direction and it matches the model. With different servos in remodelled parts
 //!   that has to be measured per joint, so it is a parameter: [`FeetechConfig::directions`].
-//! - **There is no IMU on this bus.** The `imu_to_dxl` board speaks Dynamixel Protocol 2; until
-//!   a Feetech-speaking IMU source exists this backend reports the default orientation and
-//!   says, through [`RobotIo::imu_ready`], that it is not a measurement.
+//! - **The IMU answers in the same `sync_read`.** The `imu_to_dxl` board's firmware speaks the
+//!   same Feetech framing as the servos and maps its sample onto the same register window
+//!   ([`READ_ADDR`] · [`READ_LEN`]), so one transaction still carries joints and orientation
+//!   together — the same "one transaction" [`crate::bus`] makes. It is asked **last** in the
+//!   list, not first: the board fires its reply a fixed delay after the instruction while a
+//!   servo's own response delay is shorter, so with the board at the head the two replies
+//!   collide and both arrive corrupt. Measured on the bench — `tools/下游改动.md`, 改动 C.
 //!
 //! Register addresses and semantics are from Feetech's *磁编码 STS 内存表* v1.1 (2026-08-27) and
 //! *SCS 通信协议* v1.0 (2026-06-09); `rustypot`'s `sts3215` table agrees with them.
@@ -29,10 +33,11 @@ use std::time::Duration;
 
 use rustypot::servo::feetech::sts3215::Sts3215Controller;
 
-use crate::imu::ImuData;
-use crate::io::{IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
+use crate::bus::{STALE_RUN_WARN, StaleImuTracker};
+use crate::imu::{IMU_BLOCK_LEN, SflpDecoder};
+use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
 use crate::model::{
-    BAUD_RATE, FACTORY_ID, FEETECH_EXPECTED_MODE, JOINT_IDS, JOINT_NAMES, NUM_JOINTS,
+    BAUD_RATE, FACTORY_ID, FEETECH_EXPECTED_MODE, IMU_DXL_ID, JOINT_IDS, JOINT_NAMES, NUM_JOINTS,
 };
 
 /// What `rustypot` returns. Its own alias is private, so it is spelled out here.
@@ -140,11 +145,20 @@ impl FeetechConfig {
 pub struct FeetechIo {
     controller: Sts3215Controller,
     config: FeetechConfig,
+    /// The `sync_read` list: the joints in [`JOINT_IDS`] order, then the IMU board **last**.
+    /// Held rather than rebuilt each tick, and the order is load-bearing — [`read_ids`] says
+    /// why.
+    ids: Vec<u8>,
     /// Encoder steps per second for one count of a speed register — 1 or 50, from `phase`.
     /// Read at [`Self::check_registers`]; 1 until then, which is what the servos ship with.
     speed_steps_per_count: f64,
     /// Voltage and temperatures from the last tick's block, so `slow_sensors` is free.
     last_slow: Option<SlowSensors>,
+    imu: SflpDecoder,
+    /// Blocks identical to their predecessor: the board answering without refreshing. The same
+    /// fault [`crate::bus::DynamixelIo`] counts, for the same reason — a frozen orientation is
+    /// invisible unless somebody counts it, and on that bus it was seen to happen.
+    stale_imu: StaleImuTracker,
 }
 
 impl FeetechIo {
@@ -152,8 +166,11 @@ impl FeetechIo {
         Ok(Self {
             controller: open_controller(port, BAUD_RATE)?,
             config,
+            ids: read_ids(),
             speed_steps_per_count: 1.0,
             last_slow: None,
+            imu: SflpDecoder::default(),
+            stale_imu: StaleImuTracker::default(),
         })
     }
 
@@ -515,27 +532,64 @@ fn decode_block(block: &[u8], direction: f64, speed_steps_per_count: f64) -> Fee
     }
 }
 
+/// The `sync_read` list: the joints in [`JOINT_IDS`] order, then the IMU board **last**.
+///
+/// The tail position is not a detail. The board answers a fixed delay after the instruction,
+/// and that delay is longer than a servo's own — asked first, its reply overlaps the first
+/// servo's and both come back corrupt; asked last it answers after every servo has had its
+/// turn. Measured on the bench, not theorised: `tools/下游改动.md`, 改动 C.
+fn read_ids() -> Vec<u8> {
+    let mut ids = Vec::with_capacity(NUM_JOINTS + 1);
+    ids.extend_from_slice(&JOINT_IDS);
+    ids.push(IMU_DXL_ID);
+    ids
+}
+
 impl RobotIo for FeetechIo {
     fn read(&mut self) -> Result<Sensors> {
         let blocks = self
             .controller
-            .sync_read_raw_data(&JOINT_IDS, READ_ADDR, READ_LEN)
-            .map_err(|e| IoError::Bus(format!("motor sync_read: {e}")))?;
-        if blocks.len() != NUM_JOINTS {
+            .sync_read_raw_data(&self.ids, READ_ADDR, READ_LEN)
+            .map_err(|e| IoError::Bus(format!("combined imu+motor sync_read: {e}")))?;
+        if blocks.len() != self.ids.len() {
             return Err(IoError::ShortRead {
                 what: "sync_read blocks",
-                expected: NUM_JOINTS,
+                expected: self.ids.len(),
                 got: blocks.len(),
             });
         }
 
-        let mut sensors = Sensors {
-            imu: ImuData::default(),
-            ..Sensors::default()
-        };
+        let mut sensors = Sensors::default();
+
+        // The last slot is the IMU board. It answers the servo window and puts its sample in
+        // the first IMU_BLOCK_LEN bytes; the three after that are a sample counter, the status
+        // bits and a reserved byte, none of which is read yet.
+        let imu_block = &blocks[NUM_JOINTS];
+        if imu_block.len() != READ_LEN as usize {
+            return Err(IoError::ShortRead {
+                what: "imu block",
+                expected: READ_LEN as usize,
+                got: imu_block.len(),
+            });
+        }
+        let mut raw = [0u8; IMU_BLOCK_LEN];
+        raw.copy_from_slice(&imu_block[..IMU_BLOCK_LEN]);
+        // Say so, or the counters are numbers nobody ever reads — but only once the run is
+        // long enough to mean something, and rate-limited past that because a board that has
+        // stopped refreshing produces one of these every tick.
+        let run = self.stale_imu.observe(&raw);
+        if run == STALE_RUN_WARN || (run > STALE_RUN_WARN && run.is_multiple_of(500)) {
+            tracing::warn!(
+                consecutive = run,
+                total = self.stale_imu.stale.total,
+                "imu board has returned the same sample {run} reads running — orientation is frozen"
+            );
+        }
+        sensors.imu = self.imu.decode(&raw);
+
         let mut temps_c = [0.0; NUM_JOINTS];
         let mut volts = Vec::with_capacity(NUM_JOINTS);
-        for (joint, block) in blocks.iter().enumerate() {
+        for (joint, block) in blocks[..NUM_JOINTS].iter().enumerate() {
             if block.len() != READ_LEN as usize {
                 return Err(IoError::ShortRead {
                     what: "motor block",
@@ -628,10 +682,15 @@ impl RobotIo for FeetechIo {
         })
     }
 
-    /// No IMU on this bus yet: the orientation in [`Sensors`] is the upright default, and this
-    /// is what tells the rest of the daemon not to treat it as a measurement.
+    fn imu_stale(&self) -> ImuStale {
+        self.stale_imu.stale
+    }
+
+    /// Orientation is a measurement once the board has filled its SFLP window; before that
+    /// [`Sensors::imu`] is the identity the decoder starts from, and this is what tells the
+    /// rest of the daemon not to treat it as one.
     fn imu_ready(&self) -> bool {
-        false
+        self.imu.ready()
     }
 }
 
@@ -728,6 +787,17 @@ mod tests {
         assert_eq!(scale_gain(50, 0.16), 8);
         assert_eq!(scale_gain(0, 0.16), 1);
         assert_eq!(scale_gain(u16::MAX, 0.16), 254);
+    }
+
+    /// The board must be asked **last**. Asked first it collides with the first servo's own
+    /// reply and corrupts both — measured, not theorised (`tools/下游改动.md`, 改动 C).
+    #[test]
+    fn the_imu_board_is_asked_last() {
+        let ids = read_ids();
+        assert_eq!(ids.len(), NUM_JOINTS + 1);
+        assert_eq!(&ids[..NUM_JOINTS], &JOINT_IDS);
+        assert_eq!(ids[NUM_JOINTS], IMU_DXL_ID);
+        assert!(!ids[..NUM_JOINTS].contains(&IMU_DXL_ID));
     }
 
     #[test]

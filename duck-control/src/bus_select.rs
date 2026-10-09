@@ -39,6 +39,12 @@ impl BusProtocol {
     }
 }
 
+/// The two backends are not the same size: the Feetech one carries an IMU decoder and a
+/// stale-block tracker, which puts it far enough past the Dynamixel one that clippy suggests
+/// boxing it. There is one of these per process and it is never copied, so the size costs
+/// nothing anywhere — while the box would buy that nothing by putting an indirection in front
+/// of every method call the control loop makes.
+#[allow(clippy::large_enum_variant)]
 pub enum AnyBus {
     Dynamixel(DynamixelIo),
     Feetech(FeetechIo),
