@@ -75,26 +75,29 @@ const EEPROM_SETTLE: Duration = Duration::from_millis(20);
 /// taught everyone to ignore this message. Kept in step with `ImuHealth::FROZEN_RUN`, which is
 /// where the same threshold is applied to the health report — this crate is the hardware layer
 /// and deliberately does not depend on the IPC vocabulary, so the number lives in both places.
-const STALE_RUN_WARN: u64 = 25;
+pub(crate) const STALE_RUN_WARN: u64 = 25;
 
 /// Detects an IMU board that answers without refreshing, by remembering the last block.
 ///
 /// Split out from the read path so it can be tested without a serial port: the fault it
 /// describes is one nothing else on the robot reports, and it would otherwise be verifiable
 /// only against broken hardware.
+///
+/// `pub(crate)` because [`crate::bus_feetech`] has the same fault to count on its own bus, and
+/// two copies of this would drift apart at the first change to either.
 #[derive(Debug, Default)]
-struct StaleImuTracker {
+pub(crate) struct StaleImuTracker {
     /// `None` until the first block. A fixed initial value cannot work here: it would have to
     /// be all zeros, and an all-zero block is exactly what a board whose SFLP table is still
     /// empty sends — scoring a stale read against a predecessor that never existed.
     last: Option<[u8; IMU_BLOCK_LEN]>,
-    stale: ImuStale,
+    pub(crate) stale: ImuStale,
 }
 
 impl StaleImuTracker {
     /// Records one block and returns the length of the run it belongs to — 0 when the block is
     /// fresh, which is the overwhelmingly common answer.
-    fn observe(&mut self, block: &[u8; IMU_BLOCK_LEN]) -> u64 {
+    pub(crate) fn observe(&mut self, block: &[u8; IMU_BLOCK_LEN]) -> u64 {
         if self.last.replace(*block) == Some(*block) {
             self.stale.total = self.stale.total.saturating_add(1);
             self.stale.run = self.stale.run.saturating_add(1);

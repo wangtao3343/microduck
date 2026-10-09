@@ -39,6 +39,12 @@ impl BusProtocol {
     }
 }
 
+/// The two backends are not the same size: the Feetech one carries an IMU decoder and a
+/// stale-block tracker, which puts it far enough past the Dynamixel one that clippy suggests
+/// boxing it. There is one of these per process and it is never copied, so the size costs
+/// nothing anywhere — while the box would buy that nothing by putting an indirection in front
+/// of every method call the control loop makes.
+#[allow(clippy::large_enum_variant)]
 pub enum AnyBus {
     Dynamixel(DynamixelIo),
     Feetech(FeetechIo),
@@ -75,16 +81,23 @@ impl AnyBus {
         }
     }
 
-    /// The body IMU's sensor→trunk mount. Only the Dynamixel backend has an IMU to orient: the
-    /// Feetech one carries none, and its `imu_ready` says so.
+    /// The body IMU's sensor→trunk mount, which is the robot's, not the backend's.
+    ///
+    /// Both backends orient the same `imu_to_dxl` board — the Dynamixel one at ID 200 on its own
+    /// transaction, the Feetech one as the last slot of the servos' — so this has to reach both
+    /// or the duck walks with its gravity vector tilted. Call it right after [`Self::open`]:
+    /// both implementations start the decoder afresh.
     pub fn set_imu_mount(&mut self, mount: [f64; 4]) {
         each!(self, io => io.set_imu_mount(mount))
     }
 
-    /// Whether the IMU device answers, asked before the first combined read.
+    /// Whether the IMU board answers, asked before the first combined read.
     ///
-    /// The Feetech backend answers `true` unconditionally: there is no separate IMU device on
-    /// that bus to be silent, so waiting for one would wait forever.
+    /// The two backends answer a different question. On the Dynamixel bus the board is a device
+    /// of its own, so the honest ask is whether it replies. On the Feetech bus it is the last
+    /// slot of the same `sync_read` the servos answer, so there is nothing separate to ping: the
+    /// backend pays for one combined read and reports whether that transaction carried the
+    /// block. Presence either way, never readiness — see [`FeetechIo::imu_answers`].
     pub fn imu_answers(&mut self) -> Result<bool> {
         each!(self, io => io.imu_answers())
     }
