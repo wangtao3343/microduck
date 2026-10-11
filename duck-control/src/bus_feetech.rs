@@ -159,6 +159,13 @@ pub struct FeetechIo {
     /// fault [`crate::bus::DynamixelIo`] counts, for the same reason — a frozen orientation is
     /// invisible unless somebody counts it, and on that bus it was seen to happen.
     stale_imu: StaleImuTracker,
+    /// Whether this backend believes the servos are being held, i.e. what [`Self::set_torque`]
+    /// last managed to command. Load-bearing rather than bookkeeping — see [`Self::write`], where
+    /// a goal write on this hardware is also a torque-on.
+    torque_on: bool,
+    /// The last kp handed to [`Self::set_gain`], so an unchanged one costs no bus traffic. `None`
+    /// until the first write, and again after anything that may have thrown the servo's P away.
+    last_gain: Option<u16>,
 }
 
 impl FeetechIo {
@@ -171,6 +178,9 @@ impl FeetechIo {
             last_slow: None,
             imu: SflpDecoder::default(),
             stale_imu: StaleImuTracker::default(),
+            // A servo powers up limp and register 40 is SRAM, so nothing has been held yet.
+            torque_on: false,
+            last_gain: None,
         })
     }
 
@@ -409,6 +419,10 @@ impl FeetechIo {
 
     /// Torque on every servo. Every servo is written whatever the others said — see
     /// [`crate::bus::DynamixelIo::set_torque`] for the fall this guards against.
+    ///
+    /// On success this also decides what [`Self::write`] is allowed to do next, so a partial
+    /// failure leaves the previous belief alone: what is standing out there has not changed just
+    /// because one servo did not answer.
     pub fn set_torque(&mut self, on: bool) -> Result<()> {
         let mut failed = Vec::new();
         for &id in &JOINT_IDS {
@@ -417,6 +431,7 @@ impl FeetechIo {
             }
         }
         if failed.is_empty() {
+            self.torque_on = on;
             Ok(())
         } else {
             Err(IoError::Bus(failed.join("; ")))
@@ -645,7 +660,29 @@ impl RobotIo for FeetechIo {
         Ok(sensors)
     }
 
+    /// Goal positions, one `sync_write` — **unless torque is off, in which case nothing goes out
+    /// at all.**
+    ///
+    /// That early return is the whole reason this backend tracks [`Self::torque_on`]. On the
+    /// XL330 a goal write is inert while torque is off: it stores a target and the servo ignores
+    /// it. On this robot's HD-1910s (firmware 3.46) it is not — **writing register 42 sets
+    /// register 40, torque enable, to 1**. Measured on the bench, twice: set 42, read 40, get 1.
+    ///
+    /// So the control loop writing a goal every 20 ms is itself what held the duck stiff, and it
+    /// is why `robotctl robot relax` could not keep it limp — `relax` writes 40 = 0 on all
+    /// fifteen and the very next tick armed all fifteen again. The daemon never asked for torque;
+    /// it only ever asked for a position, and this firmware reads those as the same thing.
+    ///
+    /// Going limp costs nothing by skipping these. The goal stored in a limp servo is stale the
+    /// moment somebody picks the duck up, and it is not what brings it back: torque-on in
+    /// `robotd` builds its ramp with `from: sensors.positions`, the pose measured *then*, so the
+    /// first target written after [`Self::set_torque(true)`](Self::set_torque) is one the robot is
+    /// already standing in. Torque coming on is what the old code armed by accident, twenty
+    /// milliseconds at a time.
     fn write(&mut self, targets: &JointTargets) -> Result<()> {
+        if !self.torque_on {
+            return Ok(());
+        }
         let data: Vec<Vec<u8>> = targets
             .positions
             .iter()
@@ -670,24 +707,46 @@ impl RobotIo for FeetechIo {
         // The servo sends no status packet for 0x08; rustypot reports that as `Ok(false)`, so
         // only a failure to send is an error. No waiting here — `Safety::reboot_motors` calls
         // this once per servo from inside the control tick.
+        //
+        // Forget the cached gain with it: the servo comes back on whatever P it has stored, so
+        // the next `set_gain` has to go out on the wire even if the number is unchanged.
+        self.last_gain = None;
         self.controller
             .reboot(id)
             .map(|_| ())
             .map_err(|e| IoError::Bus(format!("reboot {id}: {e}")))
     }
 
+    /// P on every servo, and only when it actually changed.
+    ///
+    /// [`crate::safety::Safety::apply`] calls this every tick, with the same kp almost always, so
+    /// the cache is what keeps this from being fifty EEPROM-area writes a second on each of
+    /// fifteen servos. That matters more here than on the Dynamixel bus for two measured reasons:
+    ///
+    /// - **A P write drops the torque bit.** Write 21 while register 40 reads 1 and 40 comes back
+    ///   0. A per-tick P write is therefore a per-tick fight with [`Self::write`] — which wins
+    ///   only because it goes out last. With the cache the argument does not happen.
+    /// - **A P write may well persist.** The module doc used to claim the closed EEPROM lock makes
+    ///   these writes take effect without being stored; that is now in doubt. Set 21 to 31 from
+    ///   the vendor tool, cut the servo's power, restore it, and 21 read back 31, not the 32 it
+    ///   shipped with. That test went through the vendor tool, which may unlock first — so it
+    ///   does not settle what *this* path (lock left closed) does — but it is enough to stop
+    ///   asserting the comforting half.
+    ///
+    /// D and I are deliberately not zeroed as they are on the XL330 — there the factory D is an
+    /// accident the prototype removed; here it is part of how the vendor tuned a 320:1 gearbox
+    /// not to ring.
     fn set_gain(&mut self, kp: u16) -> Result<()> {
-        // P only, and with the EEPROM lock left closed: the value takes effect and is not
-        // persisted, so a reboot or a power cycle restores whatever the servo was tuned to.
-        // D and I are deliberately not zeroed as they are on the XL330 — there the factory D
-        // is an accident the prototype removed; here it is part of how the vendor tuned a
-        // 320:1 gearbox not to ring.
+        if self.last_gain == Some(kp) {
+            return Ok(());
+        }
         let p = scale_gain(kp, self.config.p_scale);
         for &id in &JOINT_IDS {
             self.controller
                 .write_p_coefficient(id, p)
                 .map_err(|e| IoError::Bus(format!("p_coefficient {p} (kp {kp}) on {id}: {e}")))?;
         }
+        self.last_gain = Some(kp);
         Ok(())
     }
 
