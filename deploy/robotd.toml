@@ -45,11 +45,19 @@ port = "/dev/ttyS2"
 # protocol = "dynamixel2"
 
 # Feetech builds only. p_scale maps the XL330-scale gains used everywhere else in this file
-# onto the servo's one-byte P; directions is +1/-1 per joint (left leg, neck/head/mouth, right
-# leg), measured on the robot.
+# onto the servo's one-byte P; directions is +1/-1 per joint (left leg 20-24, neck/head/mouth
+# 30-34, right leg 10-14).
+#
+# A HD-1910 duck wants directions all -1, NOT the +1 default, and it is worth saying why: the
+# HD-1910's reading grows in the direction the XL330's shrinks, and this build reuses the XL330
+# mount, so the whole table inverts once. Measured servo by servo on the robot (the table is in
+# tools/servo-web/directions.json, where the debug console's page generates this line) — and a
+# +1 table there is not an error, it is every joint driving mirrored: `robotd init` ramps towards
+# the opposite extreme and the policy walks backwards. Nothing moves until torque is asked for.
+#
 # [bus.feetech]
 # p_scale = 0.16
-# directions = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+# directions = [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
 
 # Every value below that is commented out shows the built-in default. LEAVE IT COMMENTED
 # unless this robot genuinely needs a different value: install.sh copies this file to
